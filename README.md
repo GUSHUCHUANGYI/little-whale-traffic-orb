@@ -24,7 +24,7 @@
 
 ## 下载和运行
 
-在本仓库右侧 **Releases** 下载 `little-whale-traffic-orb-版本号-win-x64.zip`，解压后运行 **小鲸鱼流量悬浮球.exe**。
+打开 **[最新版本下载页](https://github.com/GUSHUCHUANGYI/little-whale-traffic-orb/releases/latest)**，下载 Windows x64 的 ZIP 文件，解压后运行 **小鲸鱼流量悬浮球.exe**。分享此下载页链接即可始终打开最新发布版本。
 
 支持 Windows 10 / 11 x64。便携版自带 .NET 运行时，无需另装 .NET 或 WebView2。程序没有安装器，更新前从托盘菜单退出旧版本，再解压新版。
 
