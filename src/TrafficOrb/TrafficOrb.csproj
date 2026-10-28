@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>TrafficOrb</AssemblyName>
+    <RootNamespace>TrafficOrb</RootNamespace>
+    <Version>1.2.0</Version>
+    <Title>小鲸鱼流量悬浮球</Title>
+    <Product>小鲸鱼流量悬浮球</Product>
+    <Description>Windows 桌面流量悬浮球：套餐剩余额度、本机流量分类和托盘常驻。</Description>
+    <Copyright>Copyright © 2026 Little Whale Traffic Orb contributors</Copyright>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <DebugType>none</DebugType>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+  </PropertyGroup>
+  <ItemGroup>
+    <Using Remove="System.Windows.Forms" />
+    <Using Remove="System.Drawing" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+  </ItemGroup>
+</Project>
