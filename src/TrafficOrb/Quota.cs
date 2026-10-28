@@ -58,7 +58,7 @@ public sealed class QuotaClient : IDisposable
             AllowAutoRedirect = false
         };
         var http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(15) };
-        http.DefaultRequestHeaders.UserAgent.ParseAdd("TrafficOrb/1.2");
+        http.DefaultRequestHeaders.UserAgent.ParseAdd("TrafficOrb/1.3");
         return http;
     }
     // Called between requests after a network change or failed attempt. Keeps the saved credential intact.

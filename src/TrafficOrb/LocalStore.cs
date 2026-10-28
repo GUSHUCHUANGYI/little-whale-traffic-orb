@@ -13,6 +13,7 @@ public sealed class OrbSettings
     public DateTimeOffset? LastSuccess { get; set; }
     public List<VmUsage> CachedUsage { get; set; } = [];
     public bool? StartWithWindows { get; set; }
+    public Dictionary<string, NodeBinding> NodeBindings { get; set; } = [];
 }
 
 public sealed class LocalStore

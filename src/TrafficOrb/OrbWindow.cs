@@ -64,6 +64,8 @@ public sealed class OrbWindow : Window
 {
     private readonly LocalStore store;
     private readonly QuotaClient client = new();
+    private readonly LocalConnections nodeController = new();
+    private readonly NodeSwitcher nodeSwitcher;
     private readonly OrbSettings settings;
     private readonly OrbFace face = new();
     private readonly DispatcherTimer timer;
@@ -72,6 +74,9 @@ public sealed class OrbWindow : Window
     private readonly CancellationTokenSource lifetime = new();
     private string? token;
     private bool busy, closing;
+    private bool switching;
+    private string? switchStatus;
+    private NodeBindingWindow? bindingWindow;
     private string? error;
     private ConnectWindow? login;
     private DetailsWindow? detailsWindow;
@@ -82,6 +87,7 @@ public sealed class OrbWindow : Window
 
     public OrbWindow(bool preview = false)
     {
+        nodeSwitcher = new NodeSwitcher(nodeController);
         this.preview = preview;
         store = new LocalStore(preview ? Path.Combine(Path.GetTempPath(), "TrafficOrb-Preview") : null);
         settings = preview ? new OrbSettings() : store.ReadSettings();
@@ -100,7 +106,7 @@ public sealed class OrbWindow : Window
         UseLayoutRounding = true;
         SnapsToDevicePixels = true;
         RenderOptions.SetClearTypeHint(face, ClearTypeHint.Enabled);
-        System.Windows.Automation.AutomationProperties.SetName(face, "小鲸鱼流量悬浮球，双击切换节点，单击刷新，右键菜单，可拖动");
+        System.Windows.Automation.AutomationProperties.SetName(face, "小鲸鱼流量悬浮球，双击只查看实例用量，右键切换节点，单击刷新，可拖动");
         ContextMenu = menu;
         menu.Opened += (_, _) => RebuildMenu();
         MouseLeftButtonDown += OnMouseDown;
@@ -125,8 +131,8 @@ public sealed class OrbWindow : Window
                 NetworkChange.NetworkAddressChanged -= OnNetworkAddressChanged;
                 Microsoft.Win32.SystemEvents.PowerModeChanged -= OnPowerModeChanged;
             }
-            lifetime.Cancel(); timer.Stop(); localTimer.Stop(); login?.Close(); detailsWindow?.Close();
-            resident?.Dispose(); client.Dispose(); recorder.Dispose(); lifetime.Dispose();
+            lifetime.Cancel(); timer.Stop(); localTimer.Stop(); login?.Close(); detailsWindow?.Close(); bindingWindow?.Close();
+            resident?.Dispose(); client.Dispose(); recorder.Dispose(); nodeController.Dispose(); lifetime.Dispose();
             if (!preview) SavePosition();
         };
         Loaded += async (_, _) =>
@@ -254,12 +260,67 @@ public sealed class OrbWindow : Window
         detailsWindow.Show(); detailsWindow.Activate();
         return detailsWindow;
     }
+    private async Task ChooseBindingAsync(VmUsage vm, bool switchAfter)
+    {
+        if (preview || closing || switching) return;
+        if (bindingWindow != null) { bindingWindow.Activate(); return; }
+        switching = true; switchStatus = "正在读取 Clash 节点…";
+        try
+        {
+            var choices = await nodeSwitcher.ReadAsync(lifetime.Token);
+            if (choices.Mode == "direct") throw new IOException("Clash 当前为直连模式，请先在 Clash 切到规则或全局模式");
+            if (!choices.Groups.Any(x => choices.Nodes(x.Name).Any()))
+                throw new IOException("当前 Clash 配置没有可绑定的手动代理组和节点。请先在 Clash 导入包含目标节点的配置");
+            settings.NodeBindings.TryGetValue(vm.Id, out var existing);
+            bindingWindow = new NodeBindingWindow(vm.Name, choices, existing, switchAfter);
+            NodeBinding? chosen = bindingWindow.ShowDialog() == true ? bindingWindow.Binding : null;
+            bindingWindow = null;
+            if (chosen == null) { switchStatus = "已取消，当前节点未改变"; return; }
+            settings.NodeBindings[vm.Id] = chosen; TrySave();
+            switchStatus = "绑定已保存 · 双击仍仅查看用量";
+        }
+        catch (Exception ex) when (ex is IOException or HttpRequestException or System.Text.Json.JsonException or OperationCanceledException)
+        {
+            ShowSwitchFailure(ex); return;
+        }
+        finally { switching = false; if (!closing) Redraw(); }
+        if (switchAfter) await SwitchVmAsync(vm);
+    }
+    private async Task SwitchVmAsync(VmUsage vm)
+    {
+        if (preview || closing || switching) return;
+        if (vm.Expired || !vm.Status.Equals("running", StringComparison.OrdinalIgnoreCase))
+        {
+            switchStatus = "该实例已到期或未运行，未切换节点";
+            MessageBox.Show(switchStatus, "小鲸鱼流量悬浮球"); return;
+        }
+        if (!settings.NodeBindings.TryGetValue(vm.Id, out var binding)) { await ChooseBindingAsync(vm, true); return; }
+        switching = true; switchStatus = "正在检查目标节点并切换…";
+        try
+        {
+            await nodeSwitcher.SwitchAsync(binding, lifetime.Token);
+            settings.SelectedVmId = vm.Id; TrySave();
+            switchStatus = $"Clash 已选：{binding.Node} · 新连接生效";
+            transportDirty = true;
+            _ = RefreshAsync();
+        }
+        catch (Exception ex) when (ex is IOException or HttpRequestException or System.Text.Json.JsonException or OperationCanceledException)
+        { ShowSwitchFailure(ex); }
+        finally { switching = false; if (!closing) Redraw(); }
+    }
+    private void ShowSwitchFailure(Exception exception)
+    {
+        if (closing) return;
+        switchStatus = exception is OperationCanceledException ? "Clash 响应超时，请核对当前节点" : exception.Message;
+        MessageBox.Show(switchStatus + "\n\n可从右键「绑定 Clash 节点」重新选择；双击查看用量不会切换节点。", "节点未确认切换 · 小鲸鱼流量悬浮球");
+    }
     private void RebuildMenu()
     {
         menu.Items.Clear();
         var vm = Selected;
         var status = new MenuItem { Header = busy ? "正在同步…" : error ?? (settings.LastSuccess is { } time ? $"已同步 · {time.LocalDateTime:HH:mm:ss}" : "尚未连接"), IsEnabled = false };
         menu.Items.Add(status);
+        if (switchStatus != null) menu.Items.Add(new MenuItem { Header = switchStatus, IsEnabled = false });
         if (vm != null)
         {
             menu.Items.Add(new MenuItem { Header = vm.HasTraffic ? $"本月已用 {VmUsage.Number(vm.UsedGb)} GB" : "平台未提供本月统计", IsEnabled = false });
@@ -270,7 +331,8 @@ public sealed class OrbWindow : Window
         details.Click += (_, _) => OpenDetails(); menu.Items.Add(details);
         if (settings.CachedUsage.Count > 0)
         {
-            var nodes = new MenuItem { Header = "切换实例" };
+            var nodes = new MenuItem { Header = "切换实例（同时切节点）", IsEnabled = !switching && !preview };
+            var bindings = new MenuItem { Header = "绑定 Clash 节点…", IsEnabled = !switching && !preview };
             foreach (var item in OrderedUsage)
             {
                 string title = string.IsNullOrWhiteSpace(item.Name) ? item.ShortName : item.Name;
@@ -278,17 +340,17 @@ public sealed class OrbWindow : Window
                 var entry = new MenuItem
                 {
                     Header = $"{title} · {(item.Unlimited ? "不限量" : $"{item.LimitGb:0} GB")}{(item.Expired ? " · 已到期" : "")}",
-                    IsCheckable = true, IsChecked = item.Id == settings.SelectedVmId
+                    IsCheckable = false, IsEnabled = !item.Expired && item.Status.Equals("running", StringComparison.OrdinalIgnoreCase),
+                    ToolTip = settings.NodeBindings.TryGetValue(item.Id, out var binding) ? $"切换 {binding.Group} → {binding.Node}" : "首次使用需选择这个实例对应的 Clash 节点"
                 };
-                entry.Click += async (_, _) =>
-                {
-                    settings.SelectedVmId = item.Id; TrySave(); Redraw();
-                    if (!preview) await RefreshAsync();
-                };
+                entry.Click += async (_, _) => await SwitchVmAsync(item);
                 nodes.Items.Add(entry);
+                var link = new MenuItem { Header = title + (settings.NodeBindings.ContainsKey(item.Id) ? " · 已绑定" : " · 未绑定") };
+                link.Click += async (_, _) => await ChooseBindingAsync(item, false); bindings.Items.Add(link);
             }
             menu.Items.Add(nodes);
-            var next = new MenuItem { Header = "下一个节点（双击）", IsEnabled = settings.CachedUsage.Count > 1 };
+            menu.Items.Add(bindings);
+            var next = new MenuItem { Header = "查看下个实例用量（双击，不切节点）", IsEnabled = settings.CachedUsage.Count > 1 };
             next.Click += (_, _) => CycleVm(); menu.Items.Add(next);
         }
         var refresh = new MenuItem { Header = "立即刷新", IsEnabled = !busy && !preview && token != null };
@@ -379,13 +441,14 @@ public sealed class OrbWindow : Window
         face.Fraction = vm is { HasTraffic: true } ? vm.UsedFraction : 0;
         face.Stale = vm != null && stale;
         face.Alert = vm is { HasTraffic: true } && (vm.Expired || (!vm.Unlimited && vm.UsedFraction >= .95));
-        string details = vm == null ? "点击连接独角鲸云，即可读取实际套餐流量。\n双击切换节点，右键打开菜单，拖动改变位置。" :
+        string details = vm == null ? "点击连接独角鲸云，即可读取实际套餐流量。\n双击只查看实例用量，右键切换节点，拖动改变位置。" :
             $"{vm.ShortName} · {vm.Name}\n" +
             (vm.HasTraffic ? $"本月入站：{VmUsage.Number((vm.InBytes ?? 0) / VmUsage.BytesPerGb)} GB\n本月出站：{VmUsage.Number((vm.OutBytes ?? 0) / VmUsage.BytesPerGb)} GB\n已用合计：{VmUsage.Number(vm.UsedGb)} GB\n套餐额度：{(vm.Unlimited ? "不限量" : $"{vm.LimitGb:0.##} GB")}\n" : "平台没有返回完整的本月计数。\n") +
             (vm.ExpiresAt > 0 ? $"到期：{DateTimeOffset.FromUnixTimeSeconds(vm.ExpiresAt).LocalDateTime:yyyy-MM-dd HH:mm}\n" : "") +
             $"最后成功同步：{settings.LastSuccess?.LocalDateTime.ToString("MM-dd HH:mm:ss") ?? "无"}\n" +
             (error != null ? $"{error}\n" : "") +
-            "每 60 秒读取平台；平台统计本身可能延迟。\n所有设备共享本实例额度。外圈表示已用比例。\nGB 按平台 1024³ 字节口径计算。\n双击依次切换所有节点用量；右键可直接选择。";
+            "每 60 秒读取平台；平台统计本身可能延迟。\n所有设备共享本实例额度。外圈表示已用比例。\nGB 按平台 1024³ 字节口径计算。\n双击仅查看实例用量；右键「切换实例」才切换 Clash 节点。";
+        if (switchStatus != null) details += "\n" + switchStatus;
         ToolTip = details;
         System.Windows.Automation.AutomationProperties.SetName(face, $"{face.Node}，{face.Number} {face.Unit}，{face.Footer}");
         face.InvalidateVisual();
@@ -448,5 +511,11 @@ public sealed class OrbWindow : Window
         image.Render(face);
         var png = new PngBitmapEncoder(); png.Frames.Add(BitmapFrame.Create(image));
         using var output = File.Create(file); png.Save(output);
+    }
+    internal async Task RenderSwitchMenuPreviewAsync(string file)
+    {
+        RebuildMenu(); menu.PlacementTarget = face; menu.IsOpen = true;
+        await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
+        RenderElement(menu, file); menu.IsOpen = false;
     }
 }

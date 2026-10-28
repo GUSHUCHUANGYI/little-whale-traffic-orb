@@ -8,7 +8,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>TrafficOrb</AssemblyName>
     <RootNamespace>TrafficOrb</RootNamespace>
-    <Version>1.2.0</Version>
+    <Version>1.3.0</Version>
     <Title>小鲸鱼流量悬浮球</Title>
     <Product>小鲸鱼流量悬浮球</Product>
     <Description>Windows 桌面流量悬浮球：套餐剩余额度、本机流量分类和托盘常驻。</Description>

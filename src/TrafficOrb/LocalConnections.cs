@@ -3,6 +3,7 @@ using System.IO.Pipes;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
@@ -12,29 +13,58 @@ public sealed record LocalConnection(string Id, long Upload, long Download, stri
     string Process, string Node, string Route, DateTimeOffset Start);
 public sealed record ConnectionSample(DateTimeOffset At, long UploadTotal, long DownloadTotal, List<LocalConnection> Connections);
 
-// Uses only the existing local controller. Never enables HTTP control, edits Clash or sends its secret off-device.
+// Uses only the existing local controller. Never enables HTTP control, edits config files or sends its secret off-device.
 public sealed class LocalConnections : IDisposable
 {
     private HttpClient? http;
     private string fingerprint = "";
     private string? secret;
     private readonly string configFile;
+    private readonly bool injected;
     public LocalConnections(string? configFile = null) => this.configFile = configFile ?? Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "io.github.clash-verge-rev.clash-verge-rev", "clash-verge.yaml");
 
+    internal LocalConnections(HttpMessageHandler handler)
+    {
+        configFile = ""; injected = true;
+        http = new HttpClient(handler) { BaseAddress = new Uri("http://localhost"), Timeout = TimeSpan.FromSeconds(8) };
+    }
+
     public async Task<ConnectionSample> ReadAsync(CancellationToken cancel)
     {
-        Configure();
-        using var request = new HttpRequestMessage(HttpMethod.Get, "/connections");
-        if (!string.IsNullOrEmpty(secret)) request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", secret);
-        using var response = await http!.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancel);
-        if (!response.IsSuccessStatusCode) throw new IOException("Clash 本地接口暂不可读");
-        await using var stream = await response.Content.ReadAsStreamAsync(cancel);
-        using var json = await JsonDocument.ParseAsync(stream, cancellationToken: cancel);
+        using var json = await ReadJsonAsync("/connections", cancel);
         return Parse(json.RootElement, DateTimeOffset.Now);
+    }
+    internal async Task<JsonDocument> ReadJsonAsync(string path, CancellationToken cancel)
+    {
+        using var response = await SendAsync(HttpMethod.Get, path, null, cancel);
+        await using var stream = await response.Content.ReadAsStreamAsync(cancel);
+        return await JsonDocument.ParseAsync(stream, cancellationToken: cancel);
+    }
+    internal async Task SelectAsync(string group, string node, CancellationToken cancel)
+    {
+        using var response = await SendAsync(HttpMethod.Put, "/proxies/" + Uri.EscapeDataString(group), new { name = node }, cancel);
+    }
+    private async Task<HttpResponseMessage> SendAsync(HttpMethod method, string path, object? body, CancellationToken cancel)
+    {
+        // All paths are generated inside this assembly; never send a controller secret to an absolute URL.
+        if (!path.StartsWith('/') || path.StartsWith("//") || path.Contains('\\') || path.Contains('\r') || path.Contains('\n'))
+            throw new IOException("Clash 本地接口地址无效");
+        Configure();
+        using var request = new HttpRequestMessage(method, path);
+        if (body != null) request.Content = JsonContent.Create(body);
+        if (!string.IsNullOrEmpty(secret)) request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", secret);
+        var response = await http!.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancel);
+        if (!response.IsSuccessStatusCode)
+        {
+            int code = (int)response.StatusCode; response.Dispose();
+            throw new IOException($"Clash 本地接口暂不可用 · HTTP {code}");
+        }
+        return response;
     }
     private void Configure()
     {
+        if (injected) return;
         if (!File.Exists(configFile)) throw new IOException("未找到正在使用的 Clash Verge");
         string raw = File.ReadAllText(configFile);
         string pipe = Scalar(raw, "external-controller-pipe"), endpoint = Scalar(raw, "external-controller");
@@ -58,8 +88,8 @@ public sealed class LocalConnections : IDisposable
         else if (TryLoopback(endpoint, out var local)) url = local;
         else { handler.Dispose(); throw new IOException("Clash 未提供可读取的本地接口"); }
         http?.Dispose();
-        http = new HttpClient(handler) { BaseAddress = new Uri(url), Timeout = TimeSpan.FromSeconds(3) };
-        http.DefaultRequestHeaders.UserAgent.ParseAdd("TrafficOrb/1.1");
+        http = new HttpClient(handler) { BaseAddress = new Uri(url), Timeout = TimeSpan.FromSeconds(8) };
+        http.DefaultRequestHeaders.UserAgent.ParseAdd("TrafficOrb/1.3");
         secret = newSecret; fingerprint = identity;
     }
     internal static string Scalar(string yaml, string name)

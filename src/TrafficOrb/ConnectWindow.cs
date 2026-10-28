@@ -61,7 +61,7 @@ public sealed class ConnectWindow : Window
         submit.Cursor = System.Windows.Input.Cursors.Hand;
         submit.Click += async (_, _) => await ConnectAsync();
         panel.Children.Add(submit);
-        status.Text = "只查询用量 · 凭据仅本机加密保存 · 不改 Clash";
+        status.Text = "连接账号只查询用量 · 凭据仅本机加密保存";
         status.FontSize = 11;
         status.TextWrapping = TextWrapping.Wrap;
         status.Foreground = Muted;

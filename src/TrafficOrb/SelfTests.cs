@@ -94,6 +94,7 @@ internal static class SelfTests
             Check(noisy.Summary("累计", "全部连接").Sum(x => x.Total) == 20, "racing per-connection counters cannot inflate global volume");
             Check(OrbWindow.NextVmId([vm, vm with { Id = "22222222-2222-4222-8222-222222222222" }], "22222222-2222-4222-8222-222222222222") == vm.Id &&
                 OrbWindow.NextVmId([], vm.Id) == null, "double-click selection cycles and handles an empty account");
+            CheckNodeSwitching(Check);
             string ledgerJson = JsonSerializer.Serialize(ledger.History);
             Check(!ledgerJson.Contains("api.openai.com") && !ledgerJson.Contains("cdn.googlevideo.com") && !ledgerJson.Contains("codex.exe"), "category history excludes browsing targets and process names");
             string folder = Path.Combine(Path.GetTempPath(), "TrafficOrb-Test-" + Guid.NewGuid().ToString("N"));
@@ -103,15 +104,118 @@ internal static class SelfTests
             Check(new LocalStore(folder).ReadToken() == "synthetic-test-token", "new app instance reuses encrypted credential without another login");
             File.WriteAllText(Path.Combine(folder, "account.dpapi"), "damaged encrypted file");
             Check(new LocalStore(folder).ReadToken() == "synthetic-test-token", "encrypted backup recovers a damaged primary credential");
-            store.SaveSettings(new OrbSettings { SelectedVmId = Id, CachedUsage = [row], LastSuccess = DateTimeOffset.UtcNow });
+            store.SaveSettings(new OrbSettings { SelectedVmId = Id, CachedUsage = [row], LastSuccess = DateTimeOffset.UtcNow,
+                NodeBindings = new() { [Id] = new("PROXY", "HK-demo") } });
             var settings = store.ReadSettings();
             Check(settings.CachedUsage.Count == 1 && settings.CachedUsage[0].RemainingGb == 147, "nonsecret quota cache roundtrip");
+            Check(settings.NodeBindings[Id] == new NodeBinding("PROXY", "HK-demo"), "instance node binding survives an app restart");
             foreach (string file in Directory.EnumerateFiles(folder)) File.Delete(file);
             Directory.Delete(folder);
         }
         catch (Exception e) { failure = e.Message; }
         File.WriteAllText(report, JsonSerializer.Serialize(new { ok = failure == null, passed, failure }, new JsonSerializerOptions { WriteIndented = true }));
         return failure == null ? 0 : 1;
+    }
+    private static void CheckNodeSwitching(Action<bool, string> check)
+    {
+        using (var handler = new SwitchingHandler())
+        using (var local = new LocalConnections(handler))
+        {
+            var switcher = new NodeSwitcher(local);
+            var choices = switcher.ReadAsync(default).GetAwaiter().GetResult();
+            check(handler.Writes == 0 && choices.Nodes("PROXY").Select(x => x.Name).SequenceEqual(new[] { "US-demo", "香港 / 演示" }),
+                "reading binding choices never switches and excludes DIRECT and automatic groups");
+            switcher.SwitchAsync(new("PROXY", "香港 / 演示"), default).GetAwaiter().GetResult();
+            check(handler.Writes == 1 && handler.Current == "香港 / 演示" && handler.HealthTests == 1 && handler.Verifications == 1,
+                "explicit switch checks target, writes only the selected group and verifies the new selection");
+            switcher.SwitchAsync(new("PROXY", "香港 / 演示"), default).GetAwaiter().GetResult();
+            check(handler.Writes == 1, "already selected node does not trigger another write");
+        }
+        void Reject(SwitchingHandler handler, NodeBinding binding, string message)
+        {
+            using (handler)
+            using (var local = new LocalConnections(handler))
+            {
+                bool rejected = false;
+                try { new NodeSwitcher(local).SwitchAsync(binding, default).GetAwaiter().GetResult(); }
+                catch (Exception ex) when (ex is IOException or HttpRequestException) { rejected = true; }
+                check(rejected && handler.Writes == 0 && handler.Current == "US-demo", message);
+            }
+        }
+        Reject(new() { Mode = "direct" }, new("PROXY", "香港 / 演示"), "direct mode leaves the active node unchanged");
+        Reject(new(), new("PROXY", "missing-node"), "removed or other-profile node never falls back to a different node");
+        Reject(new(), new("PROXY", "DIRECT"), "DIRECT cannot be bound as an instance node");
+        Reject(new() { Mode = "global" }, new("PROXY", "香港 / 演示"), "global mode cannot falsely report an inactive rule group switch");
+        Reject(new() { Healthy = false }, new("PROXY", "香港 / 演示"), "failed target check preserves the current proxy selection");
+        Reject(new() { InvalidDelay = true }, new("PROXY", "香港 / 演示"), "malformed target check cannot trigger a proxy write");
+        Reject(new() { ChangeProfileAfterHealth = true }, new("PROXY", "香港 / 演示"), "profile change during target check cancels the write");
+        using (var handler = new SwitchingHandler { Mode = "global" })
+        using (var local = new LocalConnections(handler))
+        {
+            new NodeSwitcher(local).SwitchAsync(new("GLOBAL", "香港 / 演示"), default).GetAwaiter().GetResult();
+            check(handler.Current == "香港 / 演示" && handler.LastWritePath == "/proxies/GLOBAL", "global mode switches GLOBAL explicitly");
+        }
+        using (var handler = new SwitchingHandler { ConfirmSelection = false })
+        using (var local = new LocalConnections(handler))
+        {
+            bool rejected = false;
+            try { new NodeSwitcher(local).SwitchAsync(new("PROXY", "香港 / 演示"), default).GetAwaiter().GetResult(); }
+            catch (IOException) { rejected = true; }
+            check(rejected && handler.Verifications == 1, "unconfirmed write is never reported as a successful switch");
+        }
+        using (var handler = new SwitchingHandler())
+        using (var local = new LocalConnections(handler))
+        {
+            bool rejected = false;
+            try { local.ReadJsonAsync("//remote.invalid/proxies", default).GetAwaiter().GetResult(); }
+            catch (IOException) { rejected = true; }
+            check(rejected && handler.Requests == 0, "controller request refuses off-device URLs before using a credential");
+        }
+    }
+    private sealed class SwitchingHandler : HttpMessageHandler
+    {
+        public string Mode = "rule", Current = "US-demo", LastWritePath = "";
+        public bool Healthy = true, ConfirmSelection = true, ChangeProfileAfterHealth, InvalidDelay;
+        public int Writes, HealthTests, Verifications, Requests;
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Requests++;
+            if (request.RequestUri?.Host != "localhost") throw new Exception("controller request left the computer");
+            string path = request.RequestUri.AbsolutePath;
+            object value;
+            if (request.Method == HttpMethod.Put)
+            {
+                if (path != "/proxies/PROXY" && path != "/proxies/GLOBAL") throw new Exception("unexpected mutation");
+                Writes++; LastWritePath = path;
+                using var body = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(cancellationToken));
+                Current = body.RootElement.GetProperty("name").GetString()!;
+                return new(HttpStatusCode.NoContent);
+            }
+            if (request.Method != HttpMethod.Get) throw new Exception("unexpected controller method");
+            if (path == "/configs") value = new { mode = Mode };
+            else if (path == "/proxies")
+            {
+                string[] members = ChangeProfileAfterHealth && HealthTests > 0 ? ["US-demo", "DIRECT"] : ["US-demo", "香港 / 演示", "DIRECT", "AUTO"];
+                value = new { proxies = new Dictionary<string, object>
+                {
+                    ["PROXY"] = new { type = "Selector", now = Current, all = members },
+                    ["GLOBAL"] = new { type = "Selector", now = Current, all = members },
+                    ["US-demo"] = new { type = "VLESS" }, ["香港 / 演示"] = new { type = "VLESS" },
+                    ["DIRECT"] = new { type = "Direct" }, ["AUTO"] = new { type = "URLTest", all = new[] { "US-demo" } }
+                } };
+            }
+            else if (path.EndsWith("/delay"))
+            {
+                if (!path.Contains(Uri.EscapeDataString("香港 / 演示"))) throw new Exception("node path was not escaped");
+                HealthTests++;
+                if (!Healthy) return new(HttpStatusCode.ServiceUnavailable);
+                value = InvalidDelay ? new { delay = (object)"invalid" } : new { delay = (object)180 };
+            }
+            else if (path is "/proxies/PROXY" or "/proxies/GLOBAL")
+            { Verifications++; value = new { now = ConfirmSelection ? Current : "US-demo" }; }
+            else throw new Exception("unexpected controller request: " + path);
+            return new(HttpStatusCode.OK) { Content = new StringContent(JsonSerializer.Serialize(value), Encoding.UTF8, "application/json") };
+        }
     }
     private sealed class FakeHandler(HttpStatusCode code, string body) : HttpMessageHandler
     {
